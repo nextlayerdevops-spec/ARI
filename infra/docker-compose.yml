@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: nextlayer-postgres
+    environment:
+      POSTGRES_USER: nextlayer
+      POSTGRES_PASSWORD: nextlayer
+      POSTGRES_DB: nextlayer
+    ports:
+      - "5432:5432"
+    volumes:
+      - nextlayer_pg:/var/lib/postgresql/data
+
+volumes:
+  nextlayer_pg:
