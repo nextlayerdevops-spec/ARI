@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 const CP_BASE =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_CP_BASE) ||
@@ -51,12 +52,14 @@ function statusBadgeClass(status: string): string {
       return `${base} bg-green-200 text-green-800 dark:bg-green-900 dark:text-green-200`;
     case "FAILED":
       return `${base} bg-red-200 text-red-800 dark:bg-red-900 dark:text-red-200`;
+    case "CANCELLED":
+      return `${base} bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200`;
     default:
       return `${base} bg-gray-100 text-gray-700`;
   }
 }
 
-const TERMINAL_STATUSES = ["SUCCEEDED", "FAILED"];
+const TERMINAL_STATUSES = ["SUCCEEDED", "FAILED", "CANCELLED"];
 
 type LogEntry = {
   id: string;
@@ -88,6 +91,7 @@ export default function RunDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
+  const router = useRouter();
   const [id, setId] = useState<string | null>(null);
   const [run, setRun] = useState<RunDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -95,6 +99,8 @@ export default function RunDetailPage({
   const [paramsCollapsed, setParamsCollapsed] = useState(true);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [logsError, setLogsError] = useState<string | null>(null);
+  const [actionLoading, setActionLoading] = useState(false);
+  const [actionFeedback, setActionFeedback] = useState<{ ok: boolean; message: string } | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const logsScrollRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
@@ -182,6 +188,56 @@ export default function RunDetailPage({
     const interval = setInterval(() => fetchLogs(id), 2000);
     return () => clearInterval(interval);
   }, [id, run?.status, fetchLogs]);
+
+  const handleCancel = useCallback(async () => {
+    if (!id) return;
+    setActionLoading(true);
+    setActionFeedback(null);
+    try {
+      const res = await fetch(`${CP_BASE}/api/runs/${id}/cancel`, { method: "POST" });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setActionFeedback({ ok: false, message: json.reason ?? json.detail ?? `HTTP ${res.status}` });
+        return;
+      }
+      setActionFeedback({ ok: true, message: "Cancelled" });
+      fetchRun(id);
+      fetchLogs(id);
+    } catch (err) {
+      setActionFeedback({ ok: false, message: err instanceof Error ? err.message : "Request failed" });
+    } finally {
+      setActionLoading(false);
+    }
+  }, [id, fetchRun, fetchLogs]);
+
+  const handleRetry = useCallback(async () => {
+    if (!id) return;
+    setActionLoading(true);
+    setActionFeedback(null);
+    try {
+      const res = await fetch(`${CP_BASE}/api/runs/${id}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setActionFeedback({ ok: false, message: json.reason ?? json.detail ?? `HTTP ${res.status}` });
+        return;
+      }
+      const newRunId = json.run?.id;
+      if (newRunId) {
+        router.push(`/runs/${newRunId}`);
+        return;
+      }
+      setActionFeedback({ ok: true, message: "Retry created" });
+      fetchRun(id);
+    } catch (err) {
+      setActionFeedback({ ok: false, message: err instanceof Error ? err.message : "Request failed" });
+    } finally {
+      setActionLoading(false);
+    }
+  }, [id, router, fetchRun]);
 
   // Auto-scroll to bottom when new logs arrive, only if user hasn't scrolled up
   useEffect(() => {
@@ -290,6 +346,47 @@ export default function RunDetailPage({
           <dt className="text-gray-500 dark:text-gray-400">Claimed by</dt>
           <dd>{r.claimed_by ?? "—"}</dd>
         </dl>
+      </section>
+
+      {/* Actions */}
+      <section className="mb-6">
+        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Actions
+        </h2>
+        <div className="flex items-center gap-2">
+          {actionLoading ? (
+            <span className="text-gray-500 text-sm">…</span>
+          ) : (r.status === "QUEUED" || r.status === "RUNNING") ? (
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="px-3 py-1.5 text-sm font-medium rounded bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-800"
+            >
+              Cancel
+            </button>
+          ) : (r.status === "FAILED" || r.status === "CANCELLED") ? (
+            <button
+              type="button"
+              onClick={handleRetry}
+              className="px-3 py-1.5 text-sm font-medium rounded bg-blue-200 text-blue-800 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-300 dark:hover:bg-blue-800"
+            >
+              Retry
+            </button>
+          ) : (
+            <span className="text-gray-500 text-sm">No actions for {r.status}</span>
+          )}
+          {actionFeedback && (
+            <span
+              className={
+                actionFeedback.ok
+                  ? "text-green-600 dark:text-green-400 text-sm"
+                  : "text-red-600 dark:text-red-400 text-sm"
+              }
+            >
+              {actionFeedback.message}
+            </span>
+          )}
+        </div>
       </section>
 
       {/* Timestamps */}

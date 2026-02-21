@@ -90,6 +90,11 @@ class RunCompleteIn(BaseModel):
     error_message: Optional[str] = None
 
 
+class RetryIn(BaseModel):
+    """Optional parameters override for retry; if omitted, original run parameters are used."""
+    parameters: Optional[dict[str, Any]] = None
+
+
 class LogAppendIn(BaseModel):
     level: str = "INFO"
     message: str

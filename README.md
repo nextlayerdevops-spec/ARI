@@ -275,8 +275,10 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/runs` - Create QUEUED run (requires APPROVED pipeline version)
 - `POST /api/runs/claim` - Atomically claim a QUEUED run (SKIP LOCKED)
 - `POST /api/runs/{id}/complete` - Transition RUNNING → SUCCEEDED/FAILED
+- `POST /api/runs/{id}/cancel` - Cancel run (QUEUED or RUNNING → CANCELLED; writes WARN log)
+- `POST /api/runs/{id}/retry` - Create new QUEUED run from FAILED/CANCELLED (optional body: `{ "parameters": { ... } }`)
 - `GET /api/runs/{id}` - Get run details
-- `GET /api/runs` - List runs with filters and pagination
+- `GET /api/runs` - List runs with filters and pagination (status filter includes CANCELLED)
 
 ### Dynamic WHERE Clause Implementation
 
@@ -914,6 +916,25 @@ if ($claimed.claimed) {
     Write-Host "Error message: $($failedRun.run.error_message)" -ForegroundColor Red
 }
 ```
+
+### Step 8: Run actions (Cancel, Retry) and worker resilience
+
+**Cancel a run (QUEUED or RUNNING):**
+
+1. Seed a tenant/pipeline/version, approve it, and trigger a run from the dashboard (or create one via API).
+2. While the run is QUEUED or RUNNING, open `/runs` or `/runs/[id]` and click **Cancel**.
+3. Confirm the run transitions to **CANCELLED**, `finished_at` is set, and a WARN log entry "Run cancelled" (source: control-plane) appears in the run logs.
+4. If the worker had claimed the run and then you cancelled it, the worker should log "complete skipped: run ... is no longer RUNNING" and continue polling (no crash).
+
+**Retry a run (FAILED or CANCELLED):**
+
+1. From a FAILED or CANCELLED run, click **Retry** on the list or detail page.
+2. Confirm a new QUEUED run is created and the UI redirects to `/runs/[new_run_id]`.
+3. Confirm the new run executes (worker claims and completes) and its logs show "Retry of \<old_run_id\>" (source: control-plane).
+
+**Worker resilience (optional):**
+
+- Stop the control plane briefly while a run is RUNNING; restart it. The worker retries the `/complete` call with backoff; once the API is back, the run should complete or you can cancel it. The worker process should not crash.
 
 ---
 

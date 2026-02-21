@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 const CP_BASE =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_CP_BASE) ||
@@ -55,6 +56,8 @@ function statusBadgeClass(status: string): string {
       return `${base} bg-green-200 text-green-800 dark:bg-green-900 dark:text-green-200`;
     case "FAILED":
       return `${base} bg-red-200 text-red-800 dark:bg-red-900 dark:text-red-200`;
+    case "CANCELLED":
+      return `${base} bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200`;
     default:
       return `${base} bg-gray-100 text-gray-700`;
   }
@@ -66,15 +69,19 @@ const STATUS_OPTIONS = [
   { value: "RUNNING", label: "RUNNING" },
   { value: "SUCCEEDED", label: "SUCCEEDED" },
   { value: "FAILED", label: "FAILED" },
+  { value: "CANCELLED", label: "CANCELLED" },
 ];
 
 export default function RunsPage() {
+  const router = useRouter();
   const [data, setData] = useState<RunsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("");
+  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<{ id: string; ok: boolean; message: string } | null>(null);
 
-  const fetchRuns = () => {
+  const fetchRuns = useCallback(() => {
     const params = new URLSearchParams({ limit: "20", offset: "0" });
     if (statusFilter) params.set("status", statusFilter);
     const url = `${CP_BASE}/api/runs?${params.toString()}`;
@@ -89,13 +96,60 @@ export default function RunsPage() {
       })
       .catch((err) => setError(err.message ?? "Failed to fetch runs"))
       .finally(() => setLoading(false));
-  };
+  }, [statusFilter]);
 
   useEffect(() => {
     fetchRuns();
     const interval = setInterval(fetchRuns, 2000);
     return () => clearInterval(interval);
-  }, [statusFilter]);
+  }, [statusFilter, fetchRuns]);
+
+  const handleCancel = async (runId: string) => {
+    setActionLoadingId(runId);
+    setActionFeedback(null);
+    try {
+      const res = await fetch(`${CP_BASE}/api/runs/${runId}/cancel`, { method: "POST" });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setActionFeedback({ id: runId, ok: false, message: json.reason ?? json.detail ?? `HTTP ${res.status}` });
+        return;
+      }
+      setActionFeedback({ id: runId, ok: true, message: "Cancelled" });
+      fetchRuns();
+    } catch (err) {
+      setActionFeedback({ id: runId, ok: false, message: err instanceof Error ? err.message : "Request failed" });
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleRetry = async (runId: string) => {
+    setActionLoadingId(runId);
+    setActionFeedback(null);
+    try {
+      const res = await fetch(`${CP_BASE}/api/runs/${runId}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setActionFeedback({ id: runId, ok: false, message: json.reason ?? json.detail ?? `HTTP ${res.status}` });
+        return;
+      }
+      const newRunId = json.run?.id;
+      if (newRunId) {
+        router.push(`/runs/${newRunId}`);
+        return;
+      }
+      setActionFeedback({ id: runId, ok: true, message: "Retry created" });
+      fetchRuns();
+    } catch (err) {
+      setActionFeedback({ id: runId, ok: false, message: err instanceof Error ? err.message : "Request failed" });
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
 
   return (
     <main className="p-6 max-w-7xl mx-auto">
@@ -138,6 +192,7 @@ export default function RunsPage() {
                 <th className="px-4 py-2 font-medium">Claimed by</th>
                 <th className="px-4 py-2 font-medium">Pipeline version</th>
                 <th className="px-4 py-2 font-medium">Error</th>
+                <th className="px-4 py-2 font-medium">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -175,11 +230,45 @@ export default function RunsPage() {
                         ? run.error_message
                         : "—"}
                     </td>
+                    <td className="px-4 py-2">
+                      {actionLoadingId === run.id ? (
+                        <span className="text-gray-500 text-xs">…</span>
+                      ) : (run.status === "QUEUED" || run.status === "RUNNING") ? (
+                        <button
+                          type="button"
+                          onClick={() => handleCancel(run.id)}
+                          className="px-2 py-1 text-xs font-medium rounded bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-800"
+                        >
+                          Cancel
+                        </button>
+                      ) : (run.status === "FAILED" || run.status === "CANCELLED") ? (
+                        <button
+                          type="button"
+                          onClick={() => handleRetry(run.id)}
+                          className="px-2 py-1 text-xs font-medium rounded bg-blue-200 text-blue-800 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-300 dark:hover:bg-blue-800"
+                        >
+                          Retry
+                        </button>
+                      ) : (
+                        "—"
+                      )}
+                      {actionFeedback?.id === run.id && (
+                        <span
+                          className={
+                            actionFeedback.ok
+                              ? "ml-2 text-green-600 dark:text-green-400 text-xs"
+                              : "ml-2 text-red-600 dark:text-red-400 text-xs"
+                          }
+                        >
+                          {actionFeedback.message}
+                        </span>
+                      )}
+                    </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={6} className="px-4 py-6 text-gray-500 text-center">
+                  <td colSpan={7} className="px-4 py-6 text-gray-500 text-center">
                     No runs found.
                   </td>
                 </tr>
