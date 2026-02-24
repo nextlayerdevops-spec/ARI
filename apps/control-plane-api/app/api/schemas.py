@@ -97,6 +97,15 @@ class RetryIn(BaseModel):
     parameters: Optional[dict[str, Any]] = None
 
 
+class HeartbeatIn(BaseModel):
+    worker_id: str
+
+
+class ReapStaleIn(BaseModel):
+    stale_after_seconds: int = 300
+    limit: int = 100
+
+
 class LogAppendIn(BaseModel):
     level: str = "INFO"
     message: str

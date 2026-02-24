@@ -7,6 +7,8 @@ CP_BASE = os.getenv("CP_BASE", "http://localhost:8000").rstrip("/")
 WORKER_ID = os.getenv("WORKER_ID", f"{socket.gethostname()}:{os.getpid()}")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
 TENANT_ID = os.getenv("TENANT_ID")
+HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "10"))
+SIMULATE_SECONDS = float(os.getenv("SIMULATE_SECONDS", "0.5"))
 
 # Backoff delays in seconds for complete_run retries (max 5 attempts)
 COMPLETE_RETRY_DELAYS = [0.5, 1.0, 2.0, 4.0, 8.0]
@@ -41,6 +43,27 @@ def claim_run(client: httpx.Client):
     r = client.post(f"{CP_BASE}/api/runs/claim", json=payload)
     r.raise_for_status()
     return r.json()
+
+
+def send_heartbeat(client: httpx.Client, run_id: str) -> bool:
+    """Send heartbeat for RUNNING run. Returns True to continue, False to stop (run no longer ours)."""
+    try:
+        r = client.post(
+            f"{CP_BASE}/api/runs/{run_id}/heartbeat",
+            json={"worker_id": WORKER_ID},
+            timeout=5,
+        )
+        if r.status_code == 409:
+            data = r.json() if r.content else {}
+            reason = data.get("reason", "")
+            if reason == "not_running":
+                return False
+            if reason == "worker_mismatch":
+                print(f"[worker] heartbeat 409 worker_mismatch (claimed_by={data.get('claimed_by')}); stopping")
+                return False
+        return True
+    except Exception:
+        return True
 
 
 def complete_run(client: httpx.Client, run_id: str, status: str, error_message: str | None = None):
@@ -98,8 +121,21 @@ def main():
                 append_log(client, run_id, "Run began executing", source="worker", meta={"step": "execute"})
                 append_log(client, run_id, "Simulate work started", source="worker", meta={"step": "simulate"})
 
-                # Placeholder for DAG execution.
-                time.sleep(0.5)
+                # Simulate work with periodic heartbeats
+                end_time = time.monotonic() + SIMULATE_SECONDS
+                last_heartbeat = time.monotonic()
+                stopped_early = False
+                while time.monotonic() < end_time:
+                    time.sleep(0.5)
+                    if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
+                        if not send_heartbeat(client, run_id):
+                            print(f"[worker] Run {run_id} no longer RUNNING; skipping completion")
+                            stopped_early = True
+                            break
+                        last_heartbeat = time.monotonic()
+
+                if stopped_early:
+                    continue
 
                 append_log(client, run_id, "Simulate work finished", source="worker", meta={"step": "simulate"})
                 out = complete_run(client, run_id, "SUCCEEDED")

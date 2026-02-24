@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { RetryRunButton } from "@/components/runs/RetryRunButton";
 
 const CP_BASE =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_CP_BASE) ||
@@ -93,7 +93,6 @@ export default function RunDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
-  const router = useRouter();
   const [id, setId] = useState<string | null>(null);
   const [run, setRun] = useState<RunDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -233,35 +232,6 @@ export default function RunDetailPage({
       setActionLoading(false);
     }
   }, [id, fetchRun, fetchLogs]);
-
-  const handleRetry = useCallback(async () => {
-    if (!id) return;
-    setActionLoading(true);
-    setActionFeedback(null);
-    try {
-      const res = await fetch(`${CP_BASE}/api/runs/${id}/retry`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setActionFeedback({ ok: false, message: json.reason ?? json.detail ?? `HTTP ${res.status}` });
-        return;
-      }
-      const newRunId = json.run?.id;
-      if (newRunId) {
-        router.push(`/runs/${newRunId}`);
-        return;
-      }
-      setActionFeedback({ ok: true, message: "Retry created" });
-      fetchRun(id);
-    } catch (err) {
-      setActionFeedback({ ok: false, message: err instanceof Error ? err.message : "Request failed" });
-    } finally {
-      setActionLoading(false);
-    }
-  }, [id, router, fetchRun]);
 
   // Auto-scroll to bottom when new logs arrive, only if user hasn't scrolled up
   useEffect(() => {
@@ -436,13 +406,11 @@ export default function RunDetailPage({
               Cancel
             </button>
           ) : (r.status === "FAILED" || r.status === "CANCELLED") ? (
-            <button
-              type="button"
-              onClick={handleRetry}
+            <RetryRunButton
+              runId={id}
+              defaultParameters={r.parameters ?? undefined}
               className="px-3 py-1.5 text-sm font-medium rounded bg-blue-200 text-blue-800 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-300 dark:hover:bg-blue-800"
-            >
-              Retry
-            </button>
+            />
           ) : (
             <span className="text-gray-500 text-sm">No actions for {r.status}</span>
           )}

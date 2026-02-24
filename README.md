@@ -279,10 +279,14 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/runs/{id}/complete` - Transition RUNNING → SUCCEEDED/FAILED
 - `POST /api/runs/{id}/cancel` - Cancel run (QUEUED or RUNNING → CANCELLED; writes WARN log)
 - `POST /api/runs/{id}/retry` - Create new QUEUED run from FAILED/CANCELLED (optional body: `{ "parameters": { ... } }`)
-- `GET /api/runs/{id}` - Get run details (includes retry_of_run_id, root_run_id when set)
+- `POST /api/runs/{id}/heartbeat` - Update heartbeat_at for RUNNING run (body: `{ "worker_id": "..." }`); 409 if not RUNNING or worker_mismatch
+- `POST /api/runs/reap-stale` - Mark stale RUNNING runs as FAILED (body: `{ "stale_after_seconds": 300, "limit": 100 }` optional)
+- `GET /api/runs/{id}` - Get run details (includes retry_of_run_id, root_run_id, heartbeat_at when set)
 - `GET /api/runs` - List runs with filters and pagination (query params: tenant_id, status, retry_of_run_id; status includes CANCELLED)
 
 **Retry lineage:** Runs created via Retry store `retry_of_run_id` (parent run) and `root_run_id` (root of the retry chain). The dashboard run detail page shows “Retry of” (link to parent) and “Retries” (child runs). Use `GET /api/runs?retry_of_run_id=<run_id>` to list child retries.
+
+**Heartbeats and stale reaper:** While a run is RUNNING, the worker calls `POST /api/runs/{id}/heartbeat` periodically (configurable via `HEARTBEAT_SECONDS`). Only the claiming worker may heartbeat (409 if status is not RUNNING or worker_mismatch). The run detail page shows `heartbeat_at`. To recover runs left RUNNING by a crashed worker, call `POST /api/runs/reap-stale` with optional body `{ "stale_after_seconds": 300, "limit": 100 }`; it marks RUNNING runs with no heartbeat within the window as FAILED and writes a WARN log.
 
 ### Dynamic WHERE Clause Implementation
 
@@ -373,6 +377,8 @@ pip install httpx
 - `POLL_SECONDS` - Polling interval in seconds (default: `1.5`)
 - `WORKER_ID` - Worker identifier (default: `{hostname}:{pid}`)
 - `TENANT_ID` - Optional tenant filter (only claim runs for this tenant)
+- `HEARTBEAT_SECONDS` - How often to send heartbeat while a run is RUNNING (default: `10`)
+- `SIMULATE_SECONDS` - Duration of simulated work (default: `0.5`; set higher e.g. `20` to test heartbeats)
 
 #### Running the Worker
 
@@ -398,7 +404,8 @@ The worker implements the following loop:
 
 2. **Execute Run** (simulated):
    - Reads `dag_spec` from pipeline version
-   - Sleeps for 0.5 seconds (placeholder for actual execution)
+   - Runs for `SIMULATE_SECONDS` (default 0.5s), sending `POST /api/runs/{id}/heartbeat` every `HEARTBEAT_SECONDS` (default 10s)
+   - If heartbeat returns 409 (run cancelled/reaped or worker_mismatch), stops without calling complete
    - Handles exceptions
 
 3. **Complete Run**: `POST /api/runs/{id}/complete`
@@ -477,12 +484,13 @@ The dashboard will be available at `http://localhost:3000`
 
 - Displays table of pipeline runs with:
   - Created timestamp (local timezone)
-  - Status badge (QUEUED/RUNNING/SUCCEEDED/FAILED)
+  - Status badge (QUEUED/RUNNING/SUCCEEDED/FAILED/CANCELLED)
   - Run ID (truncated, clickable link to detail)
   - Claimed by (worker ID)
   - Pipeline version ID (truncated)
   - Error message (if FAILED)
-- Status filter dropdown (All, QUEUED, RUNNING, SUCCEEDED, FAILED)
+  - **Actions**: Cancel (QUEUED/RUNNING), **Retry** (FAILED/CANCELLED) — Retry opens a modal to optionally override parameters (JSON object) before creating the new run
+- Status filter dropdown (All, QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED)
 - Auto-refreshes every ~2 seconds
 - Pagination info displayed (limit/offset/count)
 
@@ -494,7 +502,7 @@ The dashboard will be available at `http://localhost:3000`
   - Timestamps formatted in local timezone
   - Parameters JSON (if present)
   - Error message (if FAILED)
-- Actions: Cancel (QUEUED/RUNNING), Retry (FAILED/CANCELLED)
+- **Actions**: Cancel (QUEUED/RUNNING), **Retry** (FAILED/CANCELLED) — Retry opens a modal with the current run’s parameters (editable JSON); you can change them before creating the new run; on success you are redirected to the new run page
 - Link back to runs list
 - Fetches data on mount; polls status/logs until terminal; fetches child retries for lineage
 
@@ -513,6 +521,10 @@ The dashboard will be available at `http://localhost:3000`
 #### How to trigger a run from the UI
 
 You can create a manual run (QUEUED) from the dashboard without using PowerShell. On the **Pipeline Versions** list (`/pipeline-versions`) or on a version’s detail page (`/pipeline-versions/[id]`), for any **APPROVED** version click **Run** (list) or **Trigger run** (detail). A modal opens: enter **parameters** as a JSON object (e.g. `{}` or `{"key": "value"}`). Parameters must be valid JSON and must be an object (not an array or primitive). Click **Create run**; on success you are redirected to `/runs/[id]` where you can watch status and logs. The worker will claim and execute the run as usual.
+
+#### Retry with parameter override
+
+For a **FAILED** or **CANCELLED** run, click **Retry** on the runs list or run detail page. A modal opens with the current run’s parameters (pretty-printed JSON). You can leave them as-is or edit to override (must be a valid JSON object). Click **Create retry**; the API creates a new QUEUED run with `trigger_type: "retry"` and the given parameters, and you are redirected to `/runs/[new_run_id]`. Retry lineage (`retry_of_run_id`, `root_run_id`) is set as before.
 
 ### Features
 
@@ -943,6 +955,23 @@ if ($claimed.claimed) {
 **Worker resilience (optional):**
 
 - Stop the control plane briefly while a run is RUNNING; restart it. The worker retries the `/complete` call with backoff; once the API is back, the run should complete or you can cancel it. The worker process should not crash.
+
+### Step 9: Heartbeats and stale reaper
+
+**Heartbeat updates during RUNNING:**
+
+1. Set worker env `$env:SIMULATE_SECONDS = "20"` and `$env:HEARTBEAT_SECONDS = "5"` so the worker runs long enough to send heartbeats.
+2. Trigger a run from the dashboard; while it is RUNNING, call `GET /api/runs/{id}` and confirm `heartbeat_at` advances (or refresh the run detail page and check the Heartbeat at field).
+
+**Stale reaper (crashed worker):**
+
+1. Trigger a run so the worker claims it (status RUNNING).
+2. Kill the worker (Ctrl+C in Terminal C).
+3. Wait longer than `stale_after_seconds` (e.g. 10 seconds for a quick test).
+4. Call the reaper:  
+   `Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/runs/reap-stale" -ContentType "application/json" -Body '{"stale_after_seconds": 10}'`
+5. Confirm the run is now FAILED, `finished_at` is set, `error_message` contains "Stale: no heartbeat...", and run logs include WARN "Run marked stale by reaper" (source: control-plane).
+6. Restart the worker; it should continue claiming other runs normally.
 
 ---
 

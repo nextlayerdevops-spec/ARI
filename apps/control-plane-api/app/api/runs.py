@@ -1,11 +1,12 @@
 import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.api.schemas import LogAppendIn, RunClaimIn, RunCompleteIn, RetryIn
+from app.api.schemas import LogAppendIn, RunClaimIn, RunCompleteIn, RetryIn, HeartbeatIn, ReapStaleIn
 from app.db.deps import get_db
 from app.models.core import PipelineRun, PipelineVersion
 
@@ -197,6 +198,66 @@ LIMIT :limit OFFSET :offset
     return {"items": [_serialize_run(dict(r)) for r in rows], "limit": limit, "offset": offset, "count": len(rows)}
 
 
+@router.post("/reap-stale")
+def reap_stale(body: ReapStaleIn, db: Session = Depends(get_db)):
+    """Mark RUNNING runs with no recent heartbeat as FAILED. Manual trigger."""
+    limit = max(1, min(body.limit, 500))
+    stale_seconds = max(1, body.stale_after_seconds)
+    with db.begin():
+        rows = db.execute(
+            text(
+                """
+                SELECT id, tenant_id, heartbeat_at
+                FROM pipeline_runs
+                WHERE status = 'RUNNING'
+                  AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - CAST(:stale_seconds AS integer) * INTERVAL '1 second')
+                ORDER BY created_at ASC
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+                """
+            ),
+            {"stale_seconds": stale_seconds, "limit": limit},
+        ).mappings().all()
+        run_ids = []
+        for row in rows:
+            run_id = row["id"]
+            run_ids.append(run_id)
+            last_hb = row["heartbeat_at"]
+            last_hb_iso = last_hb.isoformat() if last_hb is not None else None
+            meta = {"stale_after_seconds": stale_seconds}
+            if last_hb_iso is not None:
+                meta["last_heartbeat_at"] = last_hb_iso
+            meta_json = json.dumps(meta)
+            db.execute(
+                text(
+                    """
+                    UPDATE pipeline_runs
+                    SET status = 'FAILED', finished_at = NOW(), updated_at = NOW(),
+                        error_message = :error_message
+                    WHERE id = :run_id
+                    """
+                ),
+                {"run_id": run_id, "error_message": f"Stale: no heartbeat for {stale_seconds}s"},
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO pipeline_run_logs (id, run_id, tenant_id, level, message, source, meta)
+                    VALUES (gen_random_uuid()::text, :run_id, :tenant_id, :level, :message, :source, CAST(:meta AS jsonb))
+                    """
+                ),
+                {
+                    "run_id": run_id,
+                    "tenant_id": row["tenant_id"],
+                    "level": "WARN",
+                    "message": "Run marked stale by reaper",
+                    "source": "control-plane",
+                    "meta": meta_json,
+                },
+            )
+    return {"ok": True, "reaped": len(run_ids), "run_ids": run_ids}
+
+
 @router.get("/{run_id}")
 def get_run(run_id: str, db: Session = Depends(get_db)):
     row = db.execute(
@@ -218,6 +279,45 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
             content={"found": False, "reason": "run_not_found"},
         )
     return {"found": True, "run": _serialize_run(dict(row))}
+
+
+@router.post("/{run_id}/heartbeat")
+def heartbeat_run(run_id: str, body: HeartbeatIn, db: Session = Depends(get_db)):
+    """Update heartbeat_at for a RUNNING run; only the claiming worker may heartbeat."""
+    run = _get_run_full(db, run_id)
+    if run is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "run_not_found"},
+        )
+    if run.get("status") != "RUNNING":
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "reason": "not_running", "status": run.get("status")},
+        )
+    claimed_by = run.get("claimed_by")
+    if claimed_by != body.worker_id:
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "reason": "worker_mismatch", "claimed_by": claimed_by},
+        )
+    run_columns = _pipeline_run_columns(db)
+    set_clauses = ["heartbeat_at = NOW()"]
+    if "updated_at" in run_columns:
+        set_clauses.append("updated_at = NOW()")
+    db.execute(
+        text(
+            f"""
+            UPDATE pipeline_runs
+            SET {", ".join(set_clauses)}
+            WHERE id = :run_id AND status = 'RUNNING' AND claimed_by = :worker_id
+            """
+        ),
+        {"run_id": run_id, "worker_id": body.worker_id},
+    )
+    db.commit()
+    now_utc = datetime.now(timezone.utc)
+    return {"ok": True, "heartbeat_at": now_utc.isoformat()}
 
 
 def _run_exists(db: Session, run_id: str) -> dict | None:
